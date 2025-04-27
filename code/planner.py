@@ -47,16 +47,79 @@ def define_dynamic_stages(total_years):
         'late': (0.1, total_years)
     }
 
-def generate_data_informed_glidepath(n_years, returns_df, floor_dict):
+def generate_historical_optimized_glidepath(n_years, returns_df, risk_free_rate=0.02):
     monthly_returns = returns_df.set_index("date")[assets]
-    monthly_mean = monthly_returns.mean() * 12
-    monthly_cov = monthly_returns.cov() * 12
-    glidepath = []
+    
+    # Define increasing risk aversion parameter as retirement approaches
+    def risk_aversion(year_pct):
+        # Start with low risk aversion (e.g., 1) and increase exponentially
+        # to high risk aversion (e.g., 10) near retirement
+        return 1 + 9 * (year_pct ** 2)
+    
+    equity_weights = []
+    
     for year in range(n_years):
-        x = year / n_years
-        equity = 0.1 + (0.8 / (1 + np.exp(10 * (x - 0.5))))
-        glidepath.append([max(min(equity, 0.9), 0.1), 1 - max(min(equity, 0.9), 0.1)])
-    return [w[0] for w in glidepath], [w[1] for w in glidepath]
+        year_pct = year / n_years
+        
+        # Calculate mean and covariance from historical data
+        rolling_mean = monthly_returns.mean() * 12
+        rolling_cov = monthly_returns.cov() * 12
+        
+        # Extract just the key values we need (assuming 2-asset model)
+        equity_mean = rolling_mean[0] 
+        bond_mean = rolling_mean[1]
+        equity_var = rolling_cov.iloc[0,0]
+        bond_var = rolling_cov.iloc[1,1]
+        cov = rolling_cov.iloc[0,1]
+        
+        # Apply risk aversion based on lifecycle stage
+        ra = risk_aversion(year_pct)
+        
+        # Calculate optimal allocation using mean-variance utility
+        # U = E[r] - (ra/2) * Var[r]
+        # For a two-asset portfolio, the optimal weight in the first asset is:
+        # w1 = (E[r1] - E[r2] + ra*Var[r2] - ra*Cov) / (ra * (Var[r1] + Var[r2] - 2*Cov))
+        
+        numerator = (equity_mean - bond_mean + ra * bond_var - ra * cov)
+        denominator = ra * (equity_var + bond_var - 2 * cov)
+        
+        if denominator == 0:
+            optimal_equity = 0.5  # Default if division by zero
+        else:
+            optimal_equity = numerator / denominator
+        
+        # Apply constraints (0.1 to 0.9)
+        optimal_equity = max(min(optimal_equity, 0.9), 0.1)
+        
+        # Final additional constraint: equity allocation should decrease over time
+        if year > 0:
+            # Maximum allowed increase from previous year (allowing some tactical flexibility)
+            max_equity = equity_weights[-1] + 0.03
+            # Enforce a minimum decrease over each 10-year period (long-term trend must be down)
+            if year % 10 == 0 and year > 0:
+                max_equity = equity_weights[max(0, year-10)] * 0.9
+            
+            optimal_equity = min(optimal_equity, max_equity)
+        
+        equity_weights.append(optimal_equity)
+    
+    # Apply final smoothing with exponential moving average
+    smoothed_weights = []
+    alpha = 0.3  # Smoothing factor
+    smoothed = equity_weights[0]
+    
+    for weight in equity_weights:
+        smoothed = alpha * weight + (1 - alpha) * smoothed
+        smoothed_weights.append(smoothed)
+    
+    # Create bond weights as complement to 1
+    bond_weights = [1 - eq for eq in smoothed_weights]
+    
+    return smoothed_weights, bond_weights
+
+def generate_data_informed_glidepath(n_years, returns_df, floor_dict):
+    """Legacy function maintained for compatibility"""
+    return generate_historical_optimized_glidepath(n_years, returns_df)
 
 # ------------------ Simulation ------------------ #
 
@@ -68,7 +131,7 @@ def simulate_retirement_plan(income, savings_rate, years, init_savings, strategy
     floor_dict = define_dynamic_stages(total_years)
 
     if strategy == "simulated":
-        stock_path, bond_path = generate_data_informed_glidepath(total_years, returns_df, floor_dict)
+        stock_path, bond_path = generate_historical_optimized_glidepath(total_years, returns_df)
     else:
         stock_path = [0.1 + (0.8 / (1 + np.exp(10 * (year / total_years - 0.5)))) for year in range(total_years)]
         bond_path = [1 - sw for sw in stock_path]
@@ -220,14 +283,14 @@ app.layout = html.Div([
 
     # ===== Chatbot Modal =====
     html.Div(id='chatbot-modal', style={
-        'display': 'none', # hidden until user clicks button
+        'display': 'none',  # hidden until user clicks button
         'position': 'fixed', 'bottom': '90px', 'right': '24px',
         'width': '380px', 'height': '500px', 'backgroundColor': COLORS['card_bg'],
         'borderRadius': '12px', 'boxShadow': '0 12px 24px rgba(0,0,0,0.3)',
         'fontFamily': 'Inter, sans-serif', 'zIndex': '1000',
         'border': f'1px solid {COLORS["border"]}',
-        'display': 'flex', 'flexDirection': 'column', 'overflow': 'hidden'
-    }, children=[
+        'flexDirection': 'column', 'overflow': 'hidden'
+}, children=[
         html.Div([
             html.H3("Retirement AI Assistant", style={'margin': '0', 'color': COLORS['text'], 'fontWeight': '600', 'fontSize': '16px'}),
             html.Button('✖', id='close-chatbot', style={'background': 'none', 'border': 'none', 'fontSize': '18px', 'cursor': 'pointer', 'color': COLORS['text_muted']})
@@ -264,6 +327,8 @@ app.layout = html.Div([
     State('income', 'value'), State('savings_rate', 'value'), State('years', 'value'),
     State('init_savings', 'value'), State('monthly_withdrawal', 'value'), State('strategy', 'value'))
 def update_plan(n_clicks, income, savings_rate, years, init_savings, monthly_withdrawal, strategy):
+    global latest_simulation_summary   # <-- ✨ Add this to modify memory
+
     if not n_clicks:
         raise PreventUpdate
 
@@ -294,6 +359,20 @@ def update_plan(n_clicks, income, savings_rate, years, init_savings, monthly_wit
                       yaxis2=dict(title='Allocation %', overlaying='y', side='right', range=[0,1], tickformat='.0%', gridcolor='#333'),
                       legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
 
+    # --- ✨ Update simulation memory for chatbot ---
+    latest_simulation_summary = (
+        f"Simulation Summary:\n"
+        f"- Strategy Used: {'Simulated Optimized' if strategy == 'simulated' else 'Industry Standard'}\n"
+        f"- Annual Net Income: ${income:,.0f}\n"
+        f"- Annual Savings Rate: {savings_rate:.1f}%\n"
+        f"- Years Until Retirement: {years}\n"
+        f"- Initial Savings: ${init_savings:,.0f}\n"
+        f"- Desired Monthly Withdrawal: ${monthly_withdrawal:,.0f}\n"
+        f"- Median Portfolio Value at Retirement: ${projected[years-1]:,.0f}\n"
+        f"- Median Portfolio Value 20 Years Later: ${projected[-1]:,.0f}"
+    )
+    # ------------------------------------------------
+
     retire_val = f"${projected[years-1]:,.2f}"
     twenty_val = f"${projected[-1]:,.2f}"
     return fig, retire_val, twenty_val
@@ -305,15 +384,34 @@ def update_plan(n_clicks, income, savings_rate, years, init_savings, monthly_wit
 def toggle_chatbot(open_clicks, close_clicks, style):
     if style is None:
         style = {'display': 'none'}
+    
     ctx = dash.callback_context
     if not ctx.triggered:
-        raise PreventUpdate
+        return {'display': 'none',  # Default to hidden
+                'position': 'fixed', 'bottom': '90px', 'right': '24px',
+                'width': '380px', 'height': '500px', 'backgroundColor': COLORS['card_bg'],
+                'borderRadius': '12px', 'boxShadow': '0 12px 24px rgba(0,0,0,0.3)',
+                'fontFamily': 'Inter, sans-serif', 'zIndex': '1000',
+                'border': f'1px solid {COLORS["border"]}',
+                'flexDirection': 'column', 'overflow': 'hidden'}
+    
     trigger = ctx.triggered[0]['prop_id'].split('.')[0]
-    style['display'] = 'block' if trigger == 'open-chatbot' else 'none'
-    return style
+    
+    # Keep all original style properties and just update display
+    updated_style = dict(style)
+    if trigger == 'open-chatbot':
+        updated_style['display'] = 'flex'  # Use flex when showing to maintain layout
+    else:
+        updated_style['display'] = 'none'
+        
+    return updated_style
 
 # --- Chatbot conversation ---
-@app.callback(Output('chatbot-response', 'children'), Input('ask-button', 'n_clicks'), State('user-question', 'value'))
+@app.callback(
+    Output('chatbot-response', 'children'),
+    Input('ask-button', 'n_clicks'),
+    State('user-question', 'value')
+)
 def update_chatbot(n_clicks, question):
     global chat_history, latest_simulation_summary
     if not n_clicks or not question:
@@ -331,12 +429,27 @@ def update_chatbot(n_clicks, question):
         align = 'left' if role.strip() == 'Assistant' else 'right'
         color = '#f1f1f1' if role.strip() == 'Assistant' else '#0074D9'
         text_color = 'black' if role.strip() == 'Assistant' else 'white'
-        bubbles.append(dcc.Markdown(text.strip(), style={'backgroundColor': color, 'color': text_color,
-                                                         'padding': '8px 12px', 'borderRadius': '16px', 'margin': '8px',
-                                                         'textAlign': align, 'maxWidth': '80%',
-                                                         'marginLeft': 'auto' if align=='right' else 'initial',
-                                                         'marginRight': 'auto' if align=='left' else 'initial'}))
+        bubbles.append(dcc.Markdown(text.strip(), style={
+            'backgroundColor': color, 'color': text_color,
+            'padding': '8px 12px', 'borderRadius': '16px', 'margin': '8px',
+            'textAlign': align, 'maxWidth': '80%',
+            'marginLeft': 'auto' if align=='right' else 'initial',
+            'marginRight': 'auto' if align=='left' else 'initial'
+        }))
+    
+    # Add a dummy div for auto-scrolling
     bubbles.append(html.Div(id='scroll-target'))
+    
+    # Add JavaScript to handle scrolling after component renders
+    bubbles.append(html.Script('''
+        setTimeout(function() {
+            var chatbox = document.getElementById('chatbot-response');
+            if (chatbox) {
+                chatbox.scrollTop = chatbox.scrollHeight;
+            }
+        }, 100);
+    '''))
+    
     return bubbles
 
 if __name__ == '__main__':
