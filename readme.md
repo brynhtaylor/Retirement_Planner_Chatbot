@@ -1,6 +1,6 @@
 # AI‑Assisted Retirement Planner
 
-**An interactive, AI-powered retirement planning tool built using Dash, Plotly, and Ollama.**  
+**An interactive, AI-assisted retirement planning tool built using Dash, Plotly, and Ollama.**  
 It allows users to dynamically simulate their financial future while asking an integrated AI assistant for tailored retirement advice based on their specific plan.
 
 ---
